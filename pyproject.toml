@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "video-to-sprite-server"
+version = "0.2.0"
+description = "MCP server that turns AI-generated reference videos into Godot-ready sprite frames (chroma-key + canvas normalize). Also exposes the underlying image-generation tools."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Tehaam Adhami" }]
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0",
+    "httpx",
+    "Pillow>=10.0",
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.scripts]
+video-to-sprite-server = "server:main"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["server.py", "sprite_processor.py", "contact_sheet.py"]

@@ -1,0 +1,15 @@
+{
+  "godot_executable": "/Applications/Godot.app/Contents/MacOS/Godot",
+  "game_project_path": "/Users/tehaamadhami/Desktop/Projects/metroidvania-shapeshifter",
+  "removebg_api_key": "",
+  "defaults": {
+    "canvas_width": 100,
+    "canvas_height": 250,
+    "char_width": 90,
+    "foot_anchor_y": 238,
+    "animation_fps": 8
+  },
+  "characters": {
+    "player": {}
+  }
+}
