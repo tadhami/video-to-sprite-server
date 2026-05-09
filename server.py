@@ -1231,6 +1231,79 @@ def _extract_frames_from_video(
     return [str(p) for p in frames[:frame_count]]
 
 
+def _sample_bg_color(input_path: str, edge_pad: int = 4) -> tuple[int, int, int]:
+    """Sample the dominant background color from a frame's outer edge.
+
+    Reads pixels from the four edges (a `edge_pad`-wide strip) and returns
+    their median RGB. The edges are almost always pure background unless the
+    character touches the frame edge — which is exactly the framing the
+    pipeline tells callers to avoid.
+    """
+    img = Image.open(input_path).convert("RGB")
+    arr = np.array(img)
+    h, w = arr.shape[:2]
+    edge_pixels = np.concatenate([
+        arr[:edge_pad, :, :].reshape(-1, 3),
+        arr[-edge_pad:, :, :].reshape(-1, 3),
+        arr[:, :edge_pad, :].reshape(-1, 3),
+        arr[:, -edge_pad:, :].reshape(-1, 3),
+    ])
+    median = np.median(edge_pixels, axis=0).astype(int)
+    return int(median[0]), int(median[1]), int(median[2])
+
+
+def _chroma_key_distance(
+    input_path: str,
+    output_path: str,
+    key_color: str | None = None,
+    hard_threshold: int = 60,
+    soft_threshold: int = 90,
+) -> str:
+    """Color-distance chroma keyer — robust on muddy / off-saturation backgrounds.
+
+    Unlike `_chroma_key` (which uses a chromatic-axis "keyness" formula that
+    over-keys when the background is desaturated or the character shares an
+    axis with the bg), this scores each pixel by its Euclidean RGB distance
+    from the key color and only keys pixels close to it:
+
+      • distance ≤ hard_threshold        → fully transparent (background)
+      • hard_threshold < d ≤ soft_threshold → partial alpha (anti-alias edge)
+      • distance > soft_threshold        → fully opaque (foreground)
+
+    If `key_color` is None, auto-samples the dominant edge color from the
+    frame — handles the common Seedance/Runway case where the user doesn't
+    know the exact backdrop hex.
+
+    This method works on any backdrop color (saturated or desaturated) and
+    will not over-key character regions whose chroma axis coincidentally
+    matches the bg, because distance is symmetric: a blue hoodie is far from
+    pink in RGB space even if both have low green channel values.
+    """
+    if key_color is None:
+        key_rgb = _sample_bg_color(input_path)
+    else:
+        key_rgb = _parse_hex_color(key_color)
+
+    img = Image.open(input_path).convert("RGBA")
+    arr = np.array(img)
+    rgb = arr[..., :3].astype(np.int32)
+    a = arr[..., 3]
+
+    diff = rgb - np.array(key_rgb, dtype=np.int32)
+    distance = np.sqrt((diff * diff).sum(axis=-1))
+
+    fully_bg = distance <= hard_threshold
+    edge = (distance > hard_threshold) & (distance <= soft_threshold)
+    edge_falloff = (distance - hard_threshold) / float(soft_threshold - hard_threshold)
+    edge_alpha = np.clip(a.astype(np.float32) * edge_falloff, 0, 255).astype(np.uint8)
+    a_new = np.where(fully_bg, np.uint8(0), np.where(edge, edge_alpha, a))
+
+    out = np.dstack([arr[..., :3], a_new])
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(out, "RGBA").save(output_path)
+    return output_path
+
+
 def _chroma_key(input_path: str, output_path: str, key_color: str = _DEFAULT_KEY_COLOR) -> str:
     """Remove a chroma-key background of arbitrary color from an image.
 
@@ -1552,6 +1625,7 @@ def _bg_remove_video_frame(
     output_path: str,
     api_key: str | None,
     key_color: str = _DEFAULT_KEY_COLOR,
+    chroma_method: str = "distance",
 ) -> str:
     """Background-removal pipeline for a single video frame.
 
@@ -1566,11 +1640,31 @@ def _bg_remove_video_frame(
          at all), fall back to remove.bg if an API key is configured, else
          flood-fill.
 
+    `chroma_method` selects the keyer:
+      - "distance" (default): Euclidean RGB distance from key_color. Robust
+        on muddy/off-saturation backgrounds (olive green, dark pink, etc.)
+        and on characters whose chroma axis overlaps the bg.
+      - "axis": original keyness-based logic. Optimal on cleanly-saturated
+        backdrops (#00FF00, #FF00FF) when the character has no axis overlap.
+
     The chroma-key is intentionally always tried first: it precisely targets
     the colored backdrop the caller's video was shot against, and remove.bg
     can produce odd results on subjects that share that channel range.
     """
-    _chroma_key(input_path, output_path, key_color)
+    if chroma_method == "distance":
+        # When the caller hasn't overridden the legacy default ("#00FF00") we
+        # treat that as "I don't know the exact bg hex" and auto-sample from
+        # the frame's edge. Distance keying only fires within ~60 RGB units
+        # of the key color, so passing literal "#00FF00" against an actual
+        # backdrop of, say, #62B540 would leave most of the bg untouched.
+        sample_bg = key_color in (_DEFAULT_KEY_COLOR, "auto", "", None)
+        _chroma_key_distance(input_path, output_path, None if sample_bg else key_color)
+    elif chroma_method == "axis":
+        _chroma_key(input_path, output_path, key_color)
+    else:
+        raise ValueError(
+            f"chroma_method must be 'distance' or 'axis', got {chroma_method!r}"
+        )
 
     keyed = Image.open(output_path).convert("RGBA")
     if keyed.split()[-1].getbbox() is not None:
@@ -1607,6 +1701,7 @@ async def generate_sprite_from_video(
     write_to_assets: bool = False,
     reference_image: str | None = None,
     key_color: str = "#00FF00",
+    chroma_method: str = "distance",
     canvas_width: int | None = None,
     canvas_height: int | None = None,
     char_width: int | None = None,
@@ -1725,7 +1820,7 @@ async def generate_sprite_from_video(
     keyed_paths: list[str] = []
     for i, raw in enumerate(extracted_paths):
         out = str(keyed_dir / f"keyed_{i}.png")
-        await asyncio.to_thread(_bg_remove_video_frame, raw, out, api_key, key_color)
+        await asyncio.to_thread(_bg_remove_video_frame, raw, out, api_key, key_color, chroma_method)
         keyed_paths.append(out)
 
     processed_paths = [str(processed_dir / f"frame_{i}.png") for i in range(len(keyed_paths))]
