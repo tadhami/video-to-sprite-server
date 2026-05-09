@@ -14,6 +14,8 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
+import re
+
 import httpx
 import numpy as np
 from PIL import Image
@@ -981,6 +983,131 @@ async def generate_game_sprite(
 
 _VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
 
+# Runway URLs we know how to resolve to a downloadable mp4
+_RUNWAY_UUID_RE = re.compile(
+    r"runwayml\.com/(?:creation|share|shared_assets)/"
+    r"(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/?",
+    re.IGNORECASE,
+)
+
+
+def _resolve_video_to_local_path(video_path_or_url: str) -> Path:
+    """Accept either a local mp4 path or a remote URL; return a local Path.
+
+    Three cases:
+      1. Local path — return as-is (must exist).
+      2. Runway URL (app.runwayml.com/{creation,share,shared_assets}/<uuid>):
+         hit the public shared-assets API, pull the signed mp4 URL, download
+         to a content-addressed cache so repeat runs of the same URL skip
+         the network round-trip.
+      3. Generic http(s) URL ending in a known video extension: just
+         download it.
+
+    The cache lives at `OUTPUT_DIR/runway-cache/<uuid-or-hash>/<filename>` —
+    safe to delete by hand to force a re-fetch.
+    """
+    s = video_path_or_url.strip()
+    is_url = s.startswith(("http://", "https://"))
+    if not is_url:
+        p = Path(s).expanduser().resolve()
+        if not p.is_file():
+            raise ValueError(f"Video file not found: {p}")
+        return p
+
+    cache_root = OUTPUT_DIR / "runway-cache"
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    # Case 2: Runway-managed URL
+    m = _RUNWAY_UUID_RE.search(s)
+    if m:
+        uuid = m.group("uuid").lower()
+        cache_dir = cache_root / uuid
+        # Skip network if cached
+        if cache_dir.is_dir():
+            existing = list(cache_dir.glob("*.mp4")) + list(cache_dir.glob("*.mov")) + list(cache_dir.glob("*.webm"))
+            if existing:
+                logger.info("runway-cache hit: reusing %s", existing[0])
+                return existing[0]
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        meta_url = f"https://api.runwayml.com/v1/shared_assets/{uuid}"
+        try:
+            resp = httpx.get(meta_url, timeout=30.0, follow_redirects=True)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to reach Runway shared-assets API for {uuid}: {exc}"
+            ) from exc
+        if resp.status_code == 404:
+            raise RuntimeError(
+                f"Runway returned 404 for asset {uuid}. The clip's sharing toggle "
+                "is probably off — open the clip in Runway, click Share, and turn "
+                "on 'Anyone with the link can view', then retry."
+            )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Runway API returned {resp.status_code} for {meta_url}: "
+                f"{resp.text[:200]}"
+            )
+        meta = resp.json()
+        artifacts = meta.get("artifacts") or []
+        if not artifacts:
+            raise RuntimeError(
+                f"Runway asset {uuid} exists but has no artifacts — "
+                "is generation still running, or did it fail?"
+            )
+        art = artifacts[0]
+        media_url = art.get("url")
+        filename = art.get("filename") or f"{uuid}.mp4"
+        if not media_url:
+            raise RuntimeError(
+                f"Runway artifact for {uuid} has no `url` field. Raw: {art}"
+            )
+
+        # Sanitize filename — Runway's titles can contain commas, slashes, etc.
+        safe_name = "".join(c if c.isalnum() or c in "._- " else "_" for c in filename).strip()
+        if not safe_name.lower().endswith(tuple(_VIDEO_EXTENSIONS)):
+            safe_name = f"{safe_name}.mp4"
+        local = cache_dir / safe_name
+
+        with httpx.stream("GET", media_url, timeout=120.0, follow_redirects=True) as r:
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"Download from Runway CDN returned {r.status_code} (URL is "
+                    f"signed and short-lived; try again)."
+                )
+            with local.open("wb") as f:
+                for chunk in r.iter_bytes(chunk_size=1 << 20):
+                    f.write(chunk)
+        logger.info("runway-cache: downloaded %s (%d bytes)", local, local.stat().st_size)
+        return local
+
+    # Case 3: Generic video URL — download as-is to a hash-keyed cache subdir
+    import hashlib
+    url_hash = hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]
+    cache_dir = cache_root / f"url-{url_hash}"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Pull a sensible filename out of the URL path
+    from urllib.parse import urlparse
+    parsed = urlparse(s)
+    filename = Path(parsed.path).name or "video.mp4"
+    if not filename.lower().endswith(tuple(_VIDEO_EXTENSIONS)):
+        raise ValueError(
+            f"URL does not look like a direct video file (no .mp4/.mov/.webm/.mkv "
+            f"extension on path): {s}. If this is a hosted-page URL rather than "
+            "a CDN file URL, paste the direct video URL instead."
+        )
+    local = cache_dir / filename
+    if local.is_file() and local.stat().st_size > 0:
+        logger.info("url cache hit: reusing %s", local)
+        return local
+    with httpx.stream("GET", s, timeout=120.0, follow_redirects=True) as r:
+        if r.status_code != 200:
+            raise RuntimeError(f"Download returned {r.status_code} for {s}")
+        with local.open("wb") as f:
+            for chunk in r.iter_bytes(chunk_size=1 << 20):
+                f.write(chunk)
+    return local
+
 # Chroma-key thresholds. "Keyness" is min(high_channels) - max(low_channels)
 # — how much the key-dominant channel(s) overpower the suppressed ones. For a
 # pure #00FF00 (green) key it equals `g - max(r, b)`; for a pure #FF00FF
@@ -1491,6 +1618,19 @@ async def generate_sprite_from_video(
     feed in a chroma-keyed MP4 from Seedance/Runway/Kling/etc. and get back
     game-ready frames laid out on the project's standard sprite canvas.
 
+    `video_path` accepts THREE forms:
+      • Local file path (existing behavior).
+      • Runway URL — `https://app.runwayml.com/creation/<UUID>`,
+        `https://app.runwayml.com/share/<UUID>`, or `…/shared_assets/<UUID>`.
+        The server hits Runway's public shared-assets API to resolve the
+        actual mp4, downloads it, and caches it for repeat runs of the same
+        URL. Requires the clip's "Anyone with the link" sharing to be ON.
+      • Generic direct video URL — any `https://….mp4|.mov|.webm|.mkv`.
+        Just gets downloaded.
+
+    Cache lives at `$GAME_ASSETS_DIR/runway-cache/<uuid>/` (default
+    `~/game-assets/runway-cache/`). Re-running the same URL is free.
+
     Pipeline:
       1. ffmpeg samples `frame_count` evenly-spaced PNGs across the clip.
       2. Each frame's chroma-key background is removed against `key_color`
@@ -1544,9 +1684,7 @@ async def generate_sprite_from_video(
     eff = _resolve_dimensions(config, character, overrides)
     fps = int(eff.get("animation_fps", 8))
 
-    video_p = Path(video_path).expanduser().resolve()
-    if not video_p.is_file():
-        raise ValueError(f"Video file not found: {video_p}")
+    video_p = await asyncio.to_thread(_resolve_video_to_local_path, video_path)
     if video_p.suffix.lower() not in _VIDEO_EXTENSIONS:
         raise ValueError(
             f"Unsupported video extension {video_p.suffix!r}; expected one of "

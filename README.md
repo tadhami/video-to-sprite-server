@@ -10,6 +10,15 @@ Also exposes the underlying image-generation tools (single asset, animated sprit
 
 ### `generate_sprite_from_video` — the headline feature
 
+**Accepts a Runway URL directly** — no need to download the mp4 first. Paste any of these into `video_path` and the server resolves it to a local mp4 for you:
+
+- `https://app.runwayml.com/creation/<UUID>`
+- `https://app.runwayml.com/share/<UUID>`
+- A direct CDN URL ending in `.mp4` / `.mov` / `.webm` / `.mkv`
+- A regular local path (existing behavior unchanged)
+
+Runway videos must have "Anyone with the link can view" enabled in the share dialog. Downloaded files are cached at `~/game-assets/runway-cache/<uuid>/` so re-running the same URL is free.
+
 Pipeline:
 
 1. Sample N evenly-spaced frames from the video with `ffmpeg`
