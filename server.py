@@ -1258,6 +1258,7 @@ def _chroma_key_distance(
     key_color: str | None = None,
     hard_threshold: int = 60,
     soft_threshold: int = 90,
+    despill_threshold: int = 140,
 ) -> str:
     """Color-distance chroma keyer — robust on muddy / off-saturation backgrounds.
 
@@ -1269,6 +1270,15 @@ def _chroma_key_distance(
       • distance ≤ hard_threshold        → fully transparent (background)
       • hard_threshold < d ≤ soft_threshold → partial alpha (anti-alias edge)
       • distance > soft_threshold        → fully opaque (foreground)
+
+    DESPILL: pixels in a wider zone (distance ≤ despill_threshold) get
+    color-corrected so the bg's chromatic contribution is removed. For a
+    green key, this pulls the green channel down toward max(red,blue) on
+    edge/fringe pixels. Without despill, anti-aliased character edges keep
+    a visible halo of the bg color (e.g. a green outline around the entire
+    character silhouette on a green-screen shoot). Despill operates on
+    chromatic axis: HIGH channels of the key color are reduced toward the
+    LOW channels' value, so red/skin/hoodie content stays intact.
 
     If `key_color` is None, auto-samples the dominant edge color from the
     frame — handles the common Seedance/Runway case where the user doesn't
@@ -1298,7 +1308,34 @@ def _chroma_key_distance(
     edge_alpha = np.clip(a.astype(np.float32) * edge_falloff, 0, 255).astype(np.uint8)
     a_new = np.where(fully_bg, np.uint8(0), np.where(edge, edge_alpha, a))
 
-    out = np.dstack([arr[..., :3], a_new])
+    # Despill: remove the bg color's chromatic contribution from any visible
+    # pixel that has the bg's chromatic tint, regardless of overall distance
+    # from the bg color. A pixel with R=180, G=200, B=80 is well clear of pure
+    # green (#00FF00) by Euclidean distance, but still visibly greenish
+    # because G > max(R,B). Distance-based despill misses these.
+    #
+    # Use keyness (min of HIGH channels minus max of LOW channels) as the
+    # despill criterion. Any visible pixel with keyness above a small
+    # threshold gets its HIGH channels pulled down toward max(LOW).
+    #
+    # Skipped if the key color is too neutral to have a chromatic axis
+    # (e.g. pure grey backdrop — nothing to despill).
+    out_rgb = arr[..., :3].copy()  # uint8
+    try:
+        high_idx, low_idx = _key_axis(key_rgb)
+        high_min = np.minimum.reduce([rgb[..., i] for i in high_idx])
+        low_max = np.maximum.reduce([rgb[..., i] for i in low_idx])
+        keyness = high_min - low_max
+        despill_zone = (keyness > 5) & (a_new > 0)
+        for hi in high_idx:
+            despilled = np.minimum(rgb[..., hi], low_max)
+            out_rgb[..., hi] = np.where(
+                despill_zone, despilled.astype(np.uint8), out_rgb[..., hi]
+            )
+    except ValueError:
+        pass  # neutral key color — no despill axis
+
+    out = np.dstack([out_rgb, a_new])
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(out, "RGBA").save(output_path)
     return output_path
