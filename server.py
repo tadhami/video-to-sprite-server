@@ -1963,6 +1963,276 @@ async def generate_sprite_from_video(
     }
 
 
+def _split_sheet_by_density(
+    image_path: str,
+    n_frames: int,
+    key_color: str = "#00FF00",
+    distance_threshold: int = 60,
+) -> list[tuple[int, int]]:
+    """Slice a horizontal sprite sheet into `n_frames` cells via density mins.
+
+    Robust to tightly-packed sheets where figures touch each other (no pure
+    background gaps between them). Algorithm:
+
+      1. Compute per-column "character density" — count of non-background
+         pixels in each column (where non-bg = pixel further than
+         `distance_threshold` from `key_color` in RGB space).
+      2. Find the leftmost and rightmost columns with any character
+         pixels — that's the non-bg span.
+      3. For each of N-1 expected boundaries (at i*span_width/N for
+         i=1..N-1), search a ±40% window and pick the column with the
+         lowest density. That's a "natural seam" between figures —
+         where character pixels are sparsest, typically a hair gap or
+         shoulder-to-shoulder pinch point.
+
+    Works even when figures literally touch — the seam still has fewer
+    character pixels than the figure interiors. Falls back gracefully on
+    sheets WITH gaps (gaps trivially win the lowest-density search).
+    """
+    img = Image.open(image_path).convert("RGB")
+    arr = np.array(img)
+    key_rgb = _parse_hex_color(key_color)
+    diff = arr.astype(np.int32) - np.array(key_rgb, dtype=np.int32)
+    distance = np.sqrt((diff * diff).sum(axis=-1))
+    non_bg = distance > distance_threshold
+
+    col_has = non_bg.any(axis=0)
+    if not col_has.any():
+        raise RuntimeError(
+            f"No non-background pixels in {image_path} (key={key_color}, "
+            f"threshold={distance_threshold}). Wrong key color?"
+        )
+    starts = np.where(col_has)[0]
+    span_start, span_end = int(starts[0]), int(starts[-1]) + 1
+    span_w = span_end - span_start
+
+    col_density = non_bg[:, span_start:span_end].sum(axis=0).astype(float)
+    expected_w = span_w / n_frames
+
+    boundaries = [span_start]
+    for i in range(1, n_frames):
+        target = span_start + int(i * expected_w)
+        radius = max(5, int(expected_w * 0.4))
+        s_lo = max(span_start + 3, target - radius)
+        s_hi = min(span_end - 3, target + radius)
+        local = col_density[s_lo - span_start : s_hi - span_start]
+        if len(local) == 0:
+            boundaries.append(target)
+        else:
+            boundaries.append(s_lo + int(np.argmin(local)))
+    boundaries.append(span_end)
+
+    return list(zip(boundaries[:-1], boundaries[1:]))
+
+
+@mcp.tool()
+async def generate_sprite_from_sheet(
+    image_path: str,
+    animation: str,
+    character: str = "player",
+    frame_count: int = 8,
+    write_to_assets: bool = False,
+    reference_image: str | None = None,
+    key_color: str = "#00FF00",
+    chroma_method: str = "distance",
+    canvas_width: int | None = None,
+    canvas_height: int | None = None,
+    char_width: int | None = None,
+    foot_anchor_y: int | None = None,
+) -> dict:
+    """Process a horizontal sprite sheet image into Godot-ready sprite frames.
+
+    Companion to `generate_sprite_from_video` for image-source pipelines:
+    feed in a sheet from Nano Banana / DALL-E / Midjourney / a hand-drawn
+    sheet, and get back the same kind of normalized per-frame outputs.
+
+    Pipeline:
+      1. `_split_sheet_by_density` slices the sheet into `frame_count`
+         cells using density-minimum boundaries (works on tightly-packed
+         sheets where figures touch — no green gaps required).
+      2. Each cell's chroma background is removed against `key_color`
+         (auto-samples per-cell when `chroma_method="distance"`).
+      3. Largest-component cleanup drops floor/shadow residue.
+      4. Frames placed on the standard canvas with shared scale across
+         the animation — same canvas-normalize logic as the video tool.
+      5. Validation against reference image, key-residue forensic check,
+         contact sheet, GIF preview, all the same artifacts as
+         `generate_sprite_from_video`.
+      6. If `write_to_assets=True`, frames written to
+         `{game_project_path}/assets/characters/{character}/{animation}/frame_N.png`.
+
+    `image_path` should point to a horizontal strip — N figures arranged
+    left-to-right in roughly equal-width cells. The cells DO NOT need
+    background gaps between them; the density splitter handles tight
+    layouts. Cells DO need to be roughly equal width and have the same
+    foot baseline across all figures.
+
+    Use `frame_count` to tell the tool how many figures the sheet
+    contains. The splitter assumes the count is exact — if you pass 8 and
+    the sheet has 6, you'll get 8 cells split arbitrarily.
+
+    Dimension precedence (highest first): tool-call args, character
+    config, defaults from config.json.
+    """
+    if frame_count < 2:
+        raise ValueError(f"frame_count must be ≥ 2, got {frame_count}")
+
+    src = Path(image_path).expanduser().resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"Sheet image not found: {src}")
+
+    config = _load_config()
+    overrides = {
+        "canvas_width": canvas_width,
+        "canvas_height": canvas_height,
+        "char_width": char_width,
+        "foot_anchor_y": foot_anchor_y,
+    }
+    eff = _resolve_dimensions(config, character, overrides)
+    fps = int(eff.get("animation_fps", 8))
+
+    if reference_image is None:
+        game_path = config.get("game_project_path", "")
+        if not game_path:
+            raise ValueError(
+                "reference_image not provided and game_project_path is "
+                "empty in config — cannot resolve default reference image."
+            )
+        reference_image = str(
+            Path(game_path) / "assets" / "characters" / character / "idle" / "frame_0.png"
+        )
+
+    _parse_hex_color(key_color)  # validate early
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    work_dir = OUTPUT_DIR / "sprites_sheet" / character / f"{animation}_{timestamp}"
+    sliced_dir = work_dir / "sliced"
+    keyed_dir = work_dir / "keyed"
+    processed_dir = work_dir / "processed"
+    sliced_dir.mkdir(parents=True, exist_ok=True)
+    keyed_dir.mkdir(parents=True, exist_ok=True)
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    # Step 1: density-min split
+    boundaries = await asyncio.to_thread(
+        _split_sheet_by_density, str(src), frame_count, key_color
+    )
+
+    sheet_img = Image.open(src).convert("RGB")
+    sheet_arr = np.array(sheet_img)
+    sliced_paths: list[str] = []
+    for i, (x0, x1) in enumerate(boundaries):
+        cell = Image.fromarray(sheet_arr[:, x0:x1, :])
+        out = str(sliced_dir / f"sliced_{i}.png")
+        cell.save(out)
+        sliced_paths.append(out)
+
+    # Step 2 + 3: bg removal + largest-component cleanup
+    api_key = config.get("removebg_api_key", "") or None
+    keyed_paths: list[str] = []
+    for i, raw in enumerate(sliced_paths):
+        out = str(keyed_dir / f"keyed_{i}.png")
+        await asyncio.to_thread(
+            _bg_remove_video_frame, raw, out, api_key, key_color, chroma_method
+        )
+        keyed_paths.append(out)
+
+    # Step 4: canvas placement with shared scale
+    processed_paths = [
+        str(processed_dir / f"frame_{i}.png") for i in range(len(keyed_paths))
+    ]
+    await asyncio.to_thread(
+        sprite_processor.canvas_normalize_batch,
+        keyed_paths,
+        processed_paths,
+        int(eff["canvas_width"]),
+        int(eff["canvas_height"]),
+        int(eff["char_width"]),
+        int(eff["foot_anchor_y"]),
+    )
+
+    # Step 5: validation + key-residue check
+    validation = await asyncio.to_thread(
+        _validate_frames, processed_paths, reference_image
+    )
+    if not validation["all_passed"]:
+        logger.warning(
+            "generate_sprite_from_sheet: %d frame(s) failed validation. "
+            "Details:\n%s",
+            len(validation["failed_indices"]),
+            validation["summary"],
+        )
+    key_residue = await asyncio.to_thread(
+        _check_key_residue, processed_paths, key_color
+    )
+
+    # Contact sheet + GIF
+    contact_sheet_path = work_dir / "contact_sheet.png"
+    contact_sheet.make_contact_sheet(
+        processed_paths,
+        str(contact_sheet_path),
+        validation=validation["frames"],
+    )
+    gif_path: str | None = None
+    if processed_paths:
+        gif_target = work_dir / "preview.gif"
+        try:
+            gif_path = await asyncio.to_thread(
+                _stitch_gif, processed_paths, str(gif_target), fps
+            )
+        except Exception as exc:
+            logger.warning("Pillow GIF stitch failed (%s) — no preview GIF", exc)
+
+    # Step 6: copy to game project
+    written = False
+    game_path = config.get("game_project_path", "")
+    if game_path:
+        preview_dir = Path(game_path) / "_preview_tmp" / animation
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        for i, p in enumerate(sliced_paths):
+            shutil.copy2(p, preview_dir / f"sheet_step1_sliced_{i}.png")
+        for i, p in enumerate(keyed_paths):
+            shutil.copy2(p, preview_dir / f"sheet_step2_bg_removed_{i}.png")
+        for i, p in enumerate(processed_paths):
+            shutil.copy2(p, preview_dir / f"sheet_step3_normalized_{i}.png")
+        shutil.copy2(str(contact_sheet_path), preview_dir / "contact_sheet.png")
+        for i, p in enumerate(processed_paths):
+            shutil.copy2(p, preview_dir / f"frame_{i}.png")
+        if gif_path:
+            shutil.copy2(gif_path, preview_dir / "preview.gif")
+
+    if write_to_assets:
+        if not game_path:
+            logger.warning("write_to_assets=True but game_project_path is empty")
+        else:
+            assets_dir = (
+                Path(game_path) / "assets" / "characters" / character / animation
+            )
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            for i, src_p in enumerate(processed_paths):
+                shutil.copy2(src_p, assets_dir / f"frame_{i}.png")
+            written = True
+
+    return {
+        "frames": processed_paths,
+        "sheet": str(src),
+        "boundaries": [{"x0": x0, "x1": x1} for x0, x1 in boundaries],
+        "sliced_frames": sliced_paths,
+        "keyed_frames": keyed_paths,
+        "contact_sheet": str(contact_sheet_path),
+        "gif": gif_path,
+        "written_to_assets": written,
+        "reference_image": reference_image,
+        "effective_config": eff,
+        "validation": validation,
+        "validation_summary": validation["summary"],
+        "validation_passed": validation["all_passed"],
+        "key_residue_check": key_residue,
+        "key_residue_summary": key_residue["summary"],
+        "key_residue_passed": key_residue["all_passed"],
+    }
+
+
 def main() -> None:
     log_level = os.environ.get("LOG_LEVEL", "WARNING").upper()
     logging.basicConfig(level=getattr(logging, log_level, logging.WARNING))
