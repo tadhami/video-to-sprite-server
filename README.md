@@ -37,6 +37,12 @@ Generates a horizontal sprite sheet via OpenRouter (Gemini image preview), then 
 
 Plain prompt → image. Useful for concept art and character turnarounds.
 
+### `extract_body_parts_from_sheet` — slice a Spine 2D body-parts sheet
+
+Takes an AI-generated reference image where each body part is enclosed by a colored rectangle (default magenta `#FF00FF`) on a white background. Detects every rectangle, extracts the interior, removes white background and boundary line, crops tight to visible pixels with a transparent padding, saves each part as its own PNG. Outputs `part_NN.png` files in reading order plus a labeled debug image so you can rename them to semantic Spine slot names (`head.png`, `arm_upper_l.png`, etc.).
+
+Pairs with the body-parts prompt template documented in the project's CLAUDE.md.
+
 ---
 
 ## Why it exists
