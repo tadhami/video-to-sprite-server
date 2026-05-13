@@ -22,4 +22,4 @@ dependencies = [
 video-to-sprite-server = "server:main"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["server.py", "sprite_processor.py", "contact_sheet.py"]
+only-include = ["server.py", "sprite_processor.py", "contact_sheet.py", "body_part_extractor.py"]
