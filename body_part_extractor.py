@@ -87,7 +87,11 @@ def _bboxes_overlap_or_touch(a: dict, b: dict, max_gap: int = 0) -> tuple[bool, 
     return x_overlap, y_overlap
 
 
-def _merge_fragmented_bboxes(rects: list[dict], max_gap: int = 25) -> list[dict]:
+def _merge_fragmented_bboxes(
+    rects: list[dict],
+    max_gap: int = 25,
+    fragment_thresh: int = 50,
+) -> list[dict]:
     """Merge bboxes that are fragments of the same broken rectangle.
 
     Two fragments belong to the same rectangle when their bboxes overlap in
@@ -115,9 +119,22 @@ def _merge_fragmented_bboxes(rects: list[dict], max_gap: int = 25) -> list[dict]
         if ri != rj:
             parent[ri] = rj
 
+    def _is_thin(r: dict) -> bool:
+        """A component is a 'fragment' if its smaller bbox dim is tiny.
+        Plausible body part rectangles have both dims well above this threshold."""
+        w = r["x_max"] - r["x_min"]
+        h = r["y_max"] - r["y_min"]
+        return min(w, h) < fragment_thresh
+
     for i in range(len(rects)):
         for j in range(i + 1, len(rects)):
             a, b = rects[i], rects[j]
+            # Only consider merging if AT LEAST ONE bbox looks like a fragment.
+            # Two plausibly-sized rectangles next to each other are real
+            # neighbors (e.g., head sitting just above the torso), NOT
+            # fragments of one rectangle — never merge those.
+            if not (_is_thin(a) or _is_thin(b)):
+                continue
             x_overlap, y_overlap = _bboxes_overlap_or_touch(a, b, max_gap=max_gap)
             # Only merge "side-by-side" fragments: one axis overlaps and the
             # other has a small gap. Don't merge if one fully contains the other.
