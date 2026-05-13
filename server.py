@@ -22,6 +22,7 @@ from PIL import Image
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
 
+import body_part_extractor
 import contact_sheet
 import sprite_processor
 
@@ -2231,6 +2232,69 @@ async def generate_sprite_from_sheet(
         "key_residue_summary": key_residue["summary"],
         "key_residue_passed": key_residue["all_passed"],
     }
+
+
+@mcp.tool()
+async def extract_body_parts_from_sheet(
+    input_path: str,
+    output_dir: str | None = None,
+    boundary_color: str = "#FF00FF",
+    boundary_tolerance: int = 80,
+    padding: int = 10,
+) -> dict:
+    """Slice a body-parts reference sheet into individual transparent PNGs.
+
+    The input image is the AI-generated character body parts sheet used to
+    prepare assets for Spine 2D skeletal rigging. Each body part should be
+    enclosed by a solid colored rectangle (default magenta #FF00FF) on a
+    white background. This tool detects every rectangle, extracts each
+    part's content, removes the white background and the colored boundary
+    line, crops tight to the visible pixels with a transparent padding,
+    and saves each part as a separate PNG.
+
+    Numbering is reading order — top-to-bottom, left-to-right. A labeled
+    debug image is written alongside the parts so the caller can visually
+    confirm which rectangle got which number and rename the files to
+    semantic names like `head.png`, `torso.png`, `arm_upper_l.png`, etc.
+
+    Args:
+      input_path: Path to the body parts sheet image (PNG/JPEG).
+      output_dir: Directory to write the extracted parts. Defaults to
+                  `<input_dir>/<input_stem>_parts/` next to the input image.
+      boundary_color: Hex color of the rectangle outlines. Default `#FF00FF`.
+                      Use any saturated hex (e.g. `#00FF00`, `#00FFFF`).
+      boundary_tolerance: How loose the color match is, in summed-channel-
+                          distance (0–765). Higher allows more drift from the
+                          exact color. Default 80, which handles typical
+                          anti-aliasing and slight model drift.
+      padding: Transparent pixels added around each extracted part. Default
+               10 — gives Spine some breathing room when rotating parts so
+               there's no clipping at the bbox edges.
+
+    Returns:
+      A dict with `count` (number of parts extracted), `parts` (list with
+      `path`, `index`, `rectangle_bbox`, `content_size` per part),
+      `debug_image` (path to the labeled overview), and `output_dir`.
+    """
+    input_p = Path(input_path).expanduser().resolve()
+    if not input_p.is_file():
+        raise ValueError(f"Input image not found: {input_p}")
+    if output_dir is None:
+        output_dir = str(input_p.parent / f"{input_p.stem}_parts")
+
+    raw = boundary_color.strip().lstrip("#")
+    if len(raw) != 6:
+        raise ValueError(f"Expected 6-digit hex color (e.g. '#FF00FF'), got {boundary_color!r}")
+    rgb = tuple(int(raw[i:i + 2], 16) for i in (0, 2, 4))
+
+    return await asyncio.to_thread(
+        body_part_extractor.extract_body_parts_from_sheet,
+        str(input_p),
+        output_dir,
+        rgb,
+        int(boundary_tolerance),
+        int(padding),
+    )
 
 
 def main() -> None:
