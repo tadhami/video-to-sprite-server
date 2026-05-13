@@ -22,6 +22,175 @@ from PIL import Image, ImageDraw, ImageFont
 logger = logging.getLogger(__name__)
 
 
+def _hue_mask(
+    arr: np.ndarray,
+    target_rgb: tuple[int, int, int],
+    hue_tolerance_deg: float = 30.0,
+    min_saturation: float = 0.35,
+) -> np.ndarray:
+    """Boolean mask: pixels whose hue is within `hue_tolerance_deg` of the
+    target color's hue AND have at least `min_saturation` saturation.
+
+    Hue-based detection is far more robust to AI-rendering color drift than
+    RGB-distance: a target of pure magenta `#FF00FF` (hue 300°) will match
+    any rendered shade in roughly [270°, 330°] regardless of how saturated
+    or bright the actual pixels are. Critically, it does NOT match pinkish
+    skin tones — those have low saturation, so the saturation gate
+    excludes them.
+    """
+    # Compute target hue
+    tr, tg, tb = target_rgb
+    target_max = max(tr, tg, tb)
+    target_min = min(tr, tg, tb)
+    target_diff = target_max - target_min
+    if target_diff == 0:
+        # gray/white target — fall back to RGB distance
+        r = arr[..., 0].astype(int); g = arr[..., 1].astype(int); b = arr[..., 2].astype(int)
+        return (np.abs(r - tr) + np.abs(g - tg) + np.abs(b - tb)) < 80
+    if target_max == tr:
+        target_hue = 60.0 * (((tg - tb) / target_diff) % 6)
+    elif target_max == tg:
+        target_hue = 60.0 * ((tb - tr) / target_diff + 2)
+    else:
+        target_hue = 60.0 * ((tr - tg) / target_diff + 4)
+
+    # Vectorized HSV for the image
+    r = arr[..., 0].astype(float)
+    g = arr[..., 1].astype(float)
+    b = arr[..., 2].astype(float)
+    max_c = np.maximum.reduce([r, g, b])
+    min_c = np.minimum.reduce([r, g, b])
+    diff = max_c - min_c
+    saturation = np.where(max_c > 0, diff / np.maximum(max_c, 1), 0)
+
+    # Pixel hue (degrees)
+    hue = np.zeros_like(max_c)
+    mr = (max_c == r) & (diff > 0)
+    mg = (max_c == g) & (diff > 0)
+    mb = (max_c == b) & (diff > 0)
+    hue[mr] = 60.0 * (((g[mr] - b[mr]) / diff[mr]) % 6)
+    hue[mg] = 60.0 * ((b[mg] - r[mg]) / diff[mg] + 2)
+    hue[mb] = 60.0 * ((r[mb] - g[mb]) / diff[mb] + 4)
+
+    # Circular hue distance
+    hue_dist = np.abs(hue - target_hue)
+    hue_dist = np.minimum(hue_dist, 360.0 - hue_dist)
+
+    return (hue_dist < hue_tolerance_deg) & (saturation >= min_saturation)
+
+
+def _bboxes_overlap_or_touch(a: dict, b: dict, max_gap: int = 0) -> tuple[bool, bool]:
+    """Return (x_overlap, y_overlap) where each is True if the bboxes overlap
+    or are within `max_gap` pixels on that axis."""
+    x_overlap = not (a["x_max"] + max_gap < b["x_min"] or b["x_max"] + max_gap < a["x_min"])
+    y_overlap = not (a["y_max"] + max_gap < b["y_min"] or b["y_max"] + max_gap < a["y_min"])
+    return x_overlap, y_overlap
+
+
+def _merge_fragmented_bboxes(rects: list[dict], max_gap: int = 25) -> list[dict]:
+    """Merge bboxes that are fragments of the same broken rectangle.
+
+    Two fragments belong to the same rectangle when their bboxes overlap in
+    one axis AND have a small gap (< `max_gap` pixels) in the other. This
+    catches the common failure mode where a rectangle outline has a gap in
+    its perimeter caused by anti-aliasing or model rendering noise, which
+    splits the outline into two connected components stacked next to each
+    other.
+
+    Pure overlap (one bbox inside another) is NOT merged here — that's the
+    "phantom component" case, handled by `_dedup_contained_bboxes` next.
+    """
+    if len(rects) <= 1:
+        return rects
+
+    # Build union-find for merge groups
+    parent = list(range(len(rects)))
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    for i in range(len(rects)):
+        for j in range(i + 1, len(rects)):
+            a, b = rects[i], rects[j]
+            x_overlap, y_overlap = _bboxes_overlap_or_touch(a, b, max_gap=max_gap)
+            # Only merge "side-by-side" fragments: one axis overlaps and the
+            # other has a small gap. Don't merge if one fully contains the other.
+            x_inside = (a["x_min"] >= b["x_min"] and a["x_max"] <= b["x_max"]) or \
+                       (b["x_min"] >= a["x_min"] and b["x_max"] <= a["x_max"])
+            y_inside = (a["y_min"] >= b["y_min"] and a["y_max"] <= b["y_max"]) or \
+                       (b["y_min"] >= a["y_min"] and b["y_max"] <= a["y_max"])
+            if x_inside and y_inside:
+                continue  # one is contained in the other — dedup will handle
+            if x_overlap and y_overlap:
+                # touching or overlapping but not fully contained — likely a
+                # fragmented rectangle outline
+                union(i, j)
+
+    # Build merged groups
+    groups: dict[int, list[int]] = {}
+    for i in range(len(rects)):
+        root = find(i)
+        groups.setdefault(root, []).append(i)
+
+    merged: list[dict] = []
+    for indices in groups.values():
+        members = [rects[i] for i in indices]
+        merged.append({
+            "id": members[0]["id"],
+            "x_min": min(m["x_min"] for m in members),
+            "x_max": max(m["x_max"] for m in members),
+            "y_min": min(m["y_min"] for m in members),
+            "y_max": max(m["y_max"] for m in members),
+        })
+    if len(merged) < len(rects):
+        logger.info(
+            "_merge_fragmented_bboxes: merged %d fragments into %d rectangles",
+            len(rects), len(merged),
+        )
+    return merged
+
+
+def _dedup_contained_bboxes(rects: list[dict]) -> list[dict]:
+    """Drop bboxes whose center falls inside a larger bbox.
+
+    Phantom components created by character pixels matching the boundary
+    color (e.g. button eyes inside the head's rectangle) produce small bboxes
+    that sit fully inside the real rectangle's bbox. We sort by area
+    descending and drop any subsequent bbox whose center is inside a kept
+    (larger) bbox.
+    """
+    if len(rects) <= 1:
+        return rects
+
+    sorted_rects = sorted(
+        rects,
+        key=lambda r: -((r["x_max"] - r["x_min"]) * (r["y_max"] - r["y_min"])),
+    )
+    kept: list[dict] = []
+    for r in sorted_rects:
+        cx = (r["x_min"] + r["x_max"]) // 2
+        cy = (r["y_min"] + r["y_max"]) // 2
+        is_phantom = any(
+            k["x_min"] <= cx <= k["x_max"] and k["y_min"] <= cy <= k["y_max"]
+            for k in kept
+        )
+        if is_phantom:
+            continue
+        kept.append(r)
+    if len(kept) < len(rects):
+        logger.info(
+            "_dedup_contained_bboxes: dropped %d phantom bbox(es) contained in larger ones",
+            len(rects) - len(kept),
+        )
+    return kept
+
+
 def extract_body_parts_from_sheet(
     input_path: str,
     output_dir: str,
@@ -57,30 +226,27 @@ def extract_body_parts_from_sheet(
     arr = np.array(img)
     H, W = arr.shape[:2]
 
-    # 1. Boundary-color mask
-    r = arr[..., 0].astype(int)
-    g = arr[..., 1].astype(int)
-    b = arr[..., 2].astype(int)
-    color_dist = (
-        np.abs(r - boundary_color[0])
-        + np.abs(g - boundary_color[1])
-        + np.abs(b - boundary_color[2])
-    )
-    boundary_mask = color_dist < boundary_tolerance
-
-    # 2. Close anti-aliasing gaps so each rectangle outline is one connected blob
-    boundary_mask = binary_closing(boundary_mask, iterations=2)
+    # 1. Hue-based boundary detection. RGB-distance from a target color is
+    #    confounded by lighting/saturation drift and tends to match pinkish
+    #    skin tones at high tolerance. Hue is invariant: magenta sits at
+    #    ~300°, character colors (browns, blues, greens) are far from there.
+    #    Build a boundary mask = pixels whose hue is within `hue_tolerance`
+    #    of the target color's hue AND have meaningful saturation.
+    boundary_mask = _hue_mask(arr, boundary_color, hue_tolerance_deg=30, min_saturation=0.35)
 
     if not boundary_mask.any():
         raise RuntimeError(
-            f"No boundary pixels detected with color {boundary_color} "
-            f"(tolerance {boundary_tolerance}). Are the rectangles drawn in "
-            f"the expected color? Try a different boundary_color or a "
-            f"higher boundary_tolerance."
+            f"No boundary pixels detected for color {boundary_color}. Is the "
+            f"boundary really drawn in this hue? For a magenta boundary "
+            f"pass boundary_color=(255, 0, 255)."
         )
 
-    # 3. Label connected components
-    structure = np.ones((3, 3), dtype=bool)  # 8-connectivity
+    # 2. Light morphological closing to bridge anti-aliasing gaps in the outlines
+    boundary_mask = binary_closing(boundary_mask, iterations=2)
+
+    # 3. Label connected components of the boundary mask — each labeled blob
+    #    is one rectangle outline (or a fragment of one).
+    structure = np.ones((3, 3), dtype=bool)
     labeled, n_components = label(boundary_mask, structure=structure)
 
     rectangles: list[dict] = []
@@ -103,6 +269,12 @@ def extract_body_parts_from_sheet(
             f"{min_rect_pixels} px were found. Lower `min_rect_pixels` or "
             f"check that the rectangles are unbroken."
         )
+
+    # 3a. Merge bboxes that look like fragments of the same rectangle.
+    rectangles = _merge_fragmented_bboxes(rectangles, max_gap=18)
+
+    # 3b. Drop bboxes whose center falls inside a larger bbox.
+    rectangles = _dedup_contained_bboxes(rectangles)
 
     # 4. Sort by row (bucketed by y_min // row_height) then by x_min
     # Row height heuristic: 1/3 of the median rectangle height groups same-row
